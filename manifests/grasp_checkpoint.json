@@ -1,0 +1,25 @@
+{
+    "model_identity":  "reopening_mixed_20261110/200",
+    "equivalent_copy":  "aligned_suffix_control_20261111/0",
+    "source":  "frozen independent acceptance parameter and normalization identity",
+    "task":  "lift_hold",
+    "file_sha256":  {
+                        "params/_sharding":  "04cbae7d950871c9b00456ee6335163af12a3a96562eb21b5cfd36325d239bc2",
+                        "params/manifest.ocdbt":  "a5d4baf0b6b62f7a86d6bf63ee36d4830e1e1d703449acf6d8965a71f5bb8521",
+                        "params/_METADATA":  "33632d807fb4328f2bae4bbece31544606f339eb2a2d0ecae8ffccb049b038b8",
+                        "params/array_metadatas/process_0":  "13a63262d233d4802c5eccbe69408824917f323f159cd99bc7cd237b70afefdf",
+                        "params/ocdbt.process_0/manifest.ocdbt":  "121e2146cf5e98a59d73a87567dbb0c030871690205e3ea91b9cfae5ff587ca6",
+                        "params/ocdbt.process_0/d/d4f3df13c4334f22181d6a5a200f8903":  "e6fafba8497a45fc526ece280719ec42f7c7e42eb8257dc8cfc54cb5ee51de6a",
+                        "params/ocdbt.process_0/d/bf39b11ab79630966f02f570deb632de":  "b39ac27bdee0590ba53e9bc096068545d05db803cf38a603cddddeb39498f970",
+                        "params/ocdbt.process_0/d/e2ea5dfce6f9f99713de214a8ce6e488":  "eb56ebd633cf5c7b18da4b62f131e82b1f9bbaa456ce91c7255997f509e415e6",
+                        "params/ocdbt.process_0/d/e5d27b22a434d6e7e8d250ec9fb90c96":  "8b698b66934ae094f4d14fd9f9dbe5e3e8136cb79a868782578ed91fd800fa14",
+                        "params/ocdbt.process_0/d/d2f49e539dfd720642ce9b786f14ab1c":  "cb6d089ff78a29d1768b8dc2878c92189598c1b79c6ff3d5d55b956758b27648",
+                        "params/ocdbt.process_0/d/5c3bbf91ea4f3a7439929b94bdc60550":  "a7723d27f7935cbcad06fdd193e18d37708c3fd666be2c5970ecb35670064a07",
+                        "params/ocdbt.process_0/d/843ebeea4a69302f30245972b3207584":  "45b622e1c020c6a300f9c24d58e78a56a527ca0bf0cce6a2717dcfb5ce2e7364",
+                        "params/ocdbt.process_0/d/6762be04b50a2c63c1890b1371bb9429":  "ef688b8ff7d6c6e55969917cc6141929e8441e9aea79548ce26b872da3ed049e",
+                        "params/ocdbt.process_0/d/f32bd486b7ba3845ffe907aa1b33c8af":  "4af22a76bafcd76693783b9080dbabbcb999b77f667c8618ed3c21f7880f3dfb",
+                        "params/ocdbt.process_0/d/f10433220729a2667390cf211b427974":  "d2a780d5e8adde0b50ea0f1b76ef41daed15739c7f386b8cc672c70ee0ced7c6",
+                        "params/d/9e48721120a0376d7a181360f1e7feb5":  "4cc039e1af0beeebe569daa95c29daf080423f060cdb5f752d0bc2f91da3ceb2",
+                        "assets/z1_sim_20261107/norm_stats.json":  "d8279766cab8795c530ccaa223b451bf3b1af2c0b2e23a3ee593720074d77a13"
+                    }
+}

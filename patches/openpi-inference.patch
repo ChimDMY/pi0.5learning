@@ -1,0 +1,689 @@
+diff --git a/src/openpi/models/model.py b/src/openpi/models/model.py
+index 29618b4..0f531c3 100644
+--- a/src/openpi/models/model.py
++++ b/src/openpi/models/model.py
+@@ -1,3 +1,10 @@
++"""模型公共数据结构与抽象接口。
++
++Observation、Actions 和 BaseModel 定义数据管线、训练循环、模型实现之间的契约。
++模型输入规格也用于参数初始化和假数据构造；修改字段或维度时，应同步核对 transforms
++及对应机器人策略适配器。
++"""
++
+ import abc
+ from collections.abc import Sequence
+ import dataclasses
+@@ -28,14 +35,14 @@ ArrayT = TypeVar("ArrayT", bound=jax.Array | torch.Tensor | np.ndarray)
+ 
+ 
+ class ModelType(enum.Enum):
+-    """Supported model types."""
++    """模型家族标识，用于配置选择及不同数据/策略变换分支。"""
+ 
+     PI0 = "pi0"
+     PI0_FAST = "pi0_fast"
+     PI05 = "pi05"
+ 
+ 
+-# The model always expects these images
++# 模型默认支持的三路相机视角名称；具体任务可以通过模型配置选择其中需要的视角。
+ IMAGE_KEYS = (
+     "base_0_rgb",
+     "left_wrist_0_rgb",
+@@ -43,11 +50,12 @@ IMAGE_KEYS = (
+ )
+ 
+ 
+-# This may need change if we release a small model.
++# 当前视觉主干使用的目标分辨率；预处理会将输入缩放并补边到此尺寸。
+ IMAGE_RESOLUTION = (224, 224)
+ 
+ 
+-# Data format
++# 数据格式契约：DataTransform 产出的字典在模型入口转换为 Observation 与 Actions。
++# 键名、维度和取值范围应由训练数据变换与部署策略共同保证。
+ #
+ # Data transforms produce the model input as a nested dictionary which is later converted
+ # into `Obesrvation` and `Actions` objects. See below.
+@@ -81,10 +89,12 @@ IMAGE_RESOLUTION = (224, 224)
+ @at.typecheck
+ @struct.dataclass
+ class Observation(Generic[ArrayT]):
+-    """Holds observations, i.e., inputs to the model.
++    """模型的一次观测输入，支持 JAX、PyTorch 或 NumPy 数组承载数据。
+ 
+-    See `Observation.from_dict` to see the expected dictionary form. This is the format
+-    that should be produced by the data transforms.
++    images 使用相机名到图像张量的映射，典型形状为 ``[批次..., 高, 宽, 通道]``；
++    image_masks 标记每个样本对应的视角是否有效。state 是低维机器人状态，具体语义
++    （关节角、末端位姿等）由任务配置定义。prompt token 及 FAST 专属掩码可以缺省。
++    数据管线应先产出约定的嵌套字典，再调用 from_dict 构造本对象。
+     """
+ 
+     # Images, in [-1, 1] float32.
+@@ -108,14 +118,19 @@ class Observation(Generic[ArrayT]):
+ 
+     @classmethod
+     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
+-        """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
+-        # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
++        """把数据变换产生的嵌套字典转换为强类型观测对象。
++
++        图像 uint8 输入会映射到 [-1, 1]。文本 token 与其有效位掩码必须成对出现，
++        避免模型无法区分真实 token 和 padding。该方法不负责检查机器人状态的语义/单位。
++        """
++        # token 和 mask 必须成对，否则注意力层无法正确屏蔽 padding。
+         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
+             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
+-        # If images are uint8, convert them to [-1, 1] float32.
++        # JAX/NumPy 的 uint8 图像按 NHWC 数值范围转换到 [-1, 1] 浮点数。
+         for key in data["image"]:
+             if data["image"][key].dtype == np.uint8:
+                 data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
++            # PyTorch 路径同时转换数值范围，并按其视觉模型约定转为 NCHW。
+             elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
+                 data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+         return cls(
+@@ -129,15 +144,15 @@ class Observation(Generic[ArrayT]):
+         )
+ 
+     def to_dict(self) -> at.PyTree[ArrayT]:
+-        """Convert the Observation to a nested dict."""
++        """还原为数据管线使用的字典键名，便于通用树结构工具处理。"""
+         result = dataclasses.asdict(self)
+         result["image"] = result.pop("images")
+         result["image_mask"] = result.pop("image_masks")
+         return result
+ 
+ 
+-# Defines the format of the actions. This field is included as "actions" inside the dictionary
+-# produced by the data transforms.
++# 动作块张量约定：[*b, ah, ad]，即批次维、未来时间步数、每步动作维数。
++# 这里仅定义形状和浮点类型；绝对/相对动作、单位及归一化由任务配置决定。
+ Actions = at.Float[ArrayT, "*b ah ad"]
+ 
+ 
+@@ -149,8 +164,17 @@ def preprocess_observation(
+     image_keys: Sequence[str] = IMAGE_KEYS,
+     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
+ ) -> Observation:
+-    """Preprocess the observations by performing image augmentations (if train=True), resizing (if necessary), and
+-    filling in a default image mask (if necessary).
++    """将观测图像整理为模型可直接编码的分辨率和数值形式。
++
++    训练模式下对非腕部相机做轻量裁剪/旋转，并对所有视角做颜色扰动；推理模式不做
++    随机增强。缺少 image mask 时默认视为有效。state 与 token 字段原样保留。
++
++    Args:
++        rng: 图像增强使用的 JAX 随机数键；仅 train=True 时需要有效键。
++        observation: 已结构化的原始观测。
++        train: 是否启用随机数据增强。
++        image_keys: 本模型本次实际使用的相机键集合。
++        image_resolution: 图像目标尺寸，按高、宽给出。
+     """
+ 
+     if not set(image_keys).issubset(observation.images):
+@@ -210,8 +234,10 @@ def preprocess_observation(
+ 
+ @dataclasses.dataclass(frozen=True)
+ class BaseModelConfig(abc.ABC):
+-    """Configuration shared by all models. Specific models should inherit from this class, and implement the `create`
+-    method to create the corresponding model.
++    """所有模型配置共用的基础定义。
++
++    子类提供网络特定超参数，并实现 create 与 inputs_spec。action_dim、action_horizon
++    和 max_token_len 会影响网络头、动作块形状及文本截断长度，应与数据管线保持一致。
+     """
+ 
+     # Action space dimension.
+@@ -231,7 +257,11 @@ class BaseModelConfig(abc.ABC):
+         """Create a new model, initializing parameters."""
+ 
+     def load(self, params: at.Params, *, remove_extra_params: bool = True) -> "BaseModel":
+-        """Create a model with the given parameters."""
++        """按当前配置构造模型，并将参数树装载到 NNX 模块中。
++
++        先创建仅含结构的模型以取得参数树定义，再检查权重树形状。可选地丢弃权重中
++        当前模型结构没有的多余键；缺失键或形状不匹配仍会被一致性检查报告。
++        """
+         model = nnx.eval_shape(self.create, jax.random.key(0))
+         graphdef, state = nnx.split(model)
+         if remove_extra_params:
+@@ -241,6 +271,7 @@ class BaseModelConfig(abc.ABC):
+         return nnx.merge(graphdef, state)
+ 
+     def load_pytorch(self, train_config, weight_path: str):
++        """按训练配置创建 PyTorch 版 Pi0，并从 safetensors 文件载入权重。"""
+         logger.info(f"train_config: {train_config}")
+         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
+         safetensors.torch.load_model(model, weight_path)
+@@ -251,18 +282,22 @@ class BaseModelConfig(abc.ABC):
+         """Returns the input specification for the model. Values are jax.ShapeDtypeStruct."""
+ 
+     def fake_obs(self, batch_size: int = 1) -> Observation:
++        """依据 inputs_spec 生成全 1 观测，用于初始化/形状检查，不用于效果评估。"""
+         observation_spec, _ = self.inputs_spec(batch_size=batch_size)
+         return jax.tree.map(lambda x: jnp.ones(x.shape, x.dtype), observation_spec)
+ 
+     def fake_act(self, batch_size: int = 1) -> Actions:
++        """依据 inputs_spec 生成全 1 动作块，用于初始化/形状检查。"""
+         _, action_spec = self.inputs_spec(batch_size=batch_size)
+         return jax.tree.map(lambda x: jnp.ones(x.shape, x.dtype), action_spec)
+ 
+ 
+ @dataclasses.dataclass
+ class BaseModel(nnx.Module, abc.ABC):
+-    """Base class for all model implementations. Specific models should inherit from this class. They should call
+-    super().__init__() to initialize the shared attributes (action_dim, action_horizon, and max_token_len).
++    """模型实现的公共 NNX 基类。
++
++    子类初始化时应调用父类构造函数，保存动作维数、预测时域和最大文本长度；并实现
++    compute_loss（训练目标）与 sample_actions（推理动作生成）两个核心入口。
+     """
+ 
+     action_dim: int
+@@ -277,10 +312,14 @@ class BaseModel(nnx.Module, abc.ABC):
+         actions: Actions,
+         *,
+         train: bool = False,
+-    ) -> at.Float[at.Array, "*b ah"]: ...
++    ) -> at.Float[at.Array, "*b ah"]:
++        """计算每个样本/时间步的训练损失；train 控制训练专用行为。"""
++        ...
+ 
+     @abc.abstractmethod
+-    def sample_actions(self, rng: at.KeyArrayLike, observation: Observation, **kwargs) -> Actions: ...
++    def sample_actions(self, rng: at.KeyArrayLike, observation: Observation, **kwargs) -> Actions:
++        """根据观测生成未来动作块；具体采样参数由子类实现定义。"""
++        ...
+ 
+ 
+ def restore_params(
+@@ -290,19 +329,20 @@ def restore_params(
+     dtype: jnp.dtype | None = None,
+     sharding: jax.sharding.Sharding | None = None,
+ ) -> at.Params:
+-    """Restores unstructured params PyTree from a checkpoint.
++    """从训练或发布 checkpoint 恢复纯参数 PyTree。
+ 
+-    This works with checkpoints saved with `save_state` during openpi training (see `training/checkpoints.py`) as
+-    well as pre-trained checkpoints released for openpi.
++    支持 ``training/checkpoints.py`` 保存的训练检查点及 OpenPI 发布的预训练权重。
++    JAX 数组恢复时默认将参数复制到全部设备；传入 sharding 可指定分片布局。训练状态
++    中 NNX 可能为叶子键添加 ``value`` 后缀，本函数会在返回前将该包装层剥除。
+ 
+     Args:
+-        params_path: The local path to the checkpoint directory.
+-        restore_type: The type to restore the params as. Can be set to `np.ndarray` to load the params as a numpy array.
+-        dtype: The dtype to restore all params as. If not provided, will use the original dtype from the checkpoint.
+-        sharding: The sharding to use for the params. If not provided, the params will be replicated across all devices.
++        params_path: 本地 checkpoint 目录或支持的远程 ``gs://`` 路径。
++        restore_type: 参数叶子的目标数组类型，可用 NumPy 数组进行主机侧检查。
++        dtype: 可选的统一目标 dtype；省略时保留 checkpoint 中的 dtype。
++        sharding: JAX 参数分片方式；省略时在所有可见设备上复制参数。
+ 
+     Returns:
+-        The restored params.
++        去除 NNX 状态包装后恢复的参数字典。
+     """
+     params_path = pathlib.Path(params_path).resolve() if not str(params_path).startswith("gs://") else params_path
+ 
+diff --git a/src/openpi/models/pi0.py b/src/openpi/models/pi0.py
+index ae7c459..b343597 100644
+--- a/src/openpi/models/pi0.py
++++ b/src/openpi/models/pi0.py
+@@ -1,3 +1,10 @@
++"""Pi0 / Pi0.5 的 JAX/Flax NNX 网络实现。
++
++图像和语言编码结果构成条件前缀，动作专家读取带噪动作与时间步并预测去噪方向。
++训练通过 compute_loss 学习流匹配目标，推理通过 sample_actions 迭代生成动作块。
++action_horizon 表示每次预测的未来步数，不等同于环境控制频率。
++"""
++
+ import logging
+ 
+ import einops
+@@ -17,29 +24,29 @@ logger = logging.getLogger("openpi")
+ 
+ 
+ def make_attn_mask(input_mask, mask_ar):
+-    """Adapted from big_vision.
+-
+-    Tokens can attend to valid inputs tokens which have a cumulative mask_ar
+-    smaller or equal to theirs. This way `mask_ar` bool[?B, N] can be used to
+-    setup several types of attention, for example:
+-
+-      [[1 1 1 1 1 1]]: pure causal attention.
++    """结合 token 有效位和自回归分组规则生成注意力可见性矩阵。
+ 
+-      [[0 0 0 1 1 1]]: prefix-lm attention. The first 3 tokens can attend between
+-          themselves and the last 3 tokens have a causal attention. The first
+-          entry could also be a 1 without changing behaviour.
++    ``input_mask`` 屏蔽 padding 等无效 token；``mask_ar`` 中的 True 表示当前位置
++    开启一个新的因果组，False 表示与前一位置处于同组。累计分组编号后，查询 token
++    可以关注编号不大于自身的有效 key，从而表达双向前缀注意力和分块因果注意力。
++    该逻辑改编自 big_vision。
+ 
+-      [[1 0 1 0 1 0 0 1 0 0]]: causal attention between 4 blocks. Tokens of a
+-          block can attend all previous blocks and all tokens on the same block.
++    例如，全 True 表示每个 token 独立开启因果组（纯因果）；开头为 False 的连续
++    前缀可相互双向注意，而后续组按因果顺序可见；连续多个 False 则让同一块内互看。
+ 
+     Args:
+-      input_mask: bool[B, N] true if its part of the input, false if padding.
+-      mask_ar: bool[?B, N] mask that's true where previous tokens cannot depend on
+-        it and false where it shares the same attention mask as the previous token.
++        input_mask: ``[batch, 序列长]`` 布尔张量，True 表示位置有效。
++        mask_ar: ``[1 或 batch, 序列长]`` 分组标记，可沿 batch 维广播。
++
++    Returns:
++        ``[batch, query长度, key长度]`` 的布尔掩码，True 表示允许注意力连接。
+     """
+     mask_ar = jnp.broadcast_to(mask_ar, input_mask.shape)
++    # 累加分组起点标记，具有相同累计值的位置属于可互相注意的同一个块。
+     cumsum = jnp.cumsum(mask_ar, axis=1)
++    # key 的组号不得晚于 query 的组号，保证因果性并允许组内双向注意。
+     attn_mask = cumsum[:, None, :] <= cumsum[:, :, None]
++    # query 和 key 都必须有效，padding 位置不参与注意力。
+     valid_mask = input_mask[:, None, :] * input_mask[:, :, None]
+     return jnp.logical_and(attn_mask, valid_mask)
+ 
+@@ -48,10 +55,16 @@ def make_attn_mask(input_mask, mask_ar):
+ def posemb_sincos(
+     pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
+ ) -> at.Float[at.Array, "b {embedding_dim}"]:
+-    """Computes sine-cosine positional embedding vectors for scalar positions."""
++    """将标量位置/时间映射为多频率正弦—余弦向量。
++
++    各维周期在 ``min_period`` 与 ``max_period`` 之间按对数尺度分布，低频编码较大
++    范围变化，高频保留细粒度差异。Pi0 将其用于流匹配时间步条件。embedding_dim 必须
++    为偶数，前半部分放 sin，后半部分放 cos。
++    """
+     if embedding_dim % 2 != 0:
+         raise ValueError(f"embedding_dim ({embedding_dim}) must be divisible by 2")
+ 
++    # 在对数周期区间均匀采样，构造从高频到低频的一组基函数。
+     fraction = jnp.linspace(0.0, 1.0, embedding_dim // 2)
+     period = min_period * (max_period / min_period) ** fraction
+     sinusoid_input = jnp.einsum(
+@@ -64,12 +77,21 @@ def posemb_sincos(
+ 
+ 
+ class Pi0(_model.BaseModel):
++    """将视觉语言条件编码与连续动作块生成结合起来的 Pi0 / Pi0.5 模型。
++
++    PaliGemma 主干处理图像和文本条件，动作专家处理状态（Pi0）及带噪动作 token。
++    两者通过联合 Transformer 表示交互。训练入口是 compute_loss，部署推理入口是
++    sample_actions；两者依赖相同的 token 构造和注意力约定。
++    """
++
+     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
++        """按配置初始化视觉编码器、语言主干、动作专家和投影层。"""
+         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
+         self.pi05 = config.pi05
+         paligemma_config = _gemma.get_config(config.paligemma_variant)
+         action_expert_config = _gemma.get_config(config.action_expert_variant)
+-        # TODO: rewrite gemma in NNX. For now, use bridge.
++        # Gemma 当前通过 NNX bridge 集成：主干与动作专家共用同一个模块容器，
++        # 但保持各自网络配置。Pi0.5 只在动作专家分支启用 adaRMS 条件。
+         llm = nnx_bridge.ToNNX(
+             _gemma.Module(
+                 configs=[paligemma_config, action_expert_config],
+@@ -78,6 +100,7 @@ class Pi0(_model.BaseModel):
+             )
+         )
+         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
++        # SigLIP 不做分类池化，保留所有 patch 特征，作为视觉 token 输入语言主干。
+         img = nnx_bridge.ToNNX(
+             _siglip.Module(
+                 num_classes=paligemma_config.width,
+@@ -89,11 +112,14 @@ class Pi0(_model.BaseModel):
+         )
+         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
+         self.PaliGemma = nnx.Dict(llm=llm, img=img)
++        # 连续动作维度映射到动作专家隐藏宽度；输出投影再映射回动作空间。
+         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+         if config.pi05:
++            # Pi0.5 将时间嵌入作为自适应 RMSNorm 条件传给动作专家。
+             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+         else:
++            # Pi0 将状态做成一个前缀 token，并将时间嵌入与每个动作 token 拼接。
+             self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
+             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+@@ -106,10 +132,16 @@ class Pi0(_model.BaseModel):
+     def embed_prefix(
+         self, obs: _model.Observation
+     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
++        """生成由图像和语言构成的条件前缀 token 序列。
++
++        每路图像经 SigLIP 转成 patch token；语言 token 通过 Gemma embedding 层映射。
++        前缀内部采用双向注意力，因此图像和指令 token 可彼此充分交互。返回的有效位
++        掩码屏蔽无效相机视角或文本 padding；自回归标记在这里均设为 False。
++        """
+         input_mask = []
+         ar_mask = []
+         tokens = []
+-        # embed images
++        # 逐个视角提取视觉 patch 特征，并为每个 patch 复制该视角的有效性标记。
+         for name in obs.images:
+             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+ 
+@@ -124,7 +156,7 @@ class Pi0(_model.BaseModel):
+             # image tokens attend to each other
+             ar_mask += [False] * image_tokens.shape[1]
+ 
+-        # add language (aka tokenized inputs)
++        # 加入上游 tokenizer 产生的指令 token；文本 padding 由对应 mask 标记。
+         if obs.tokenized_prompt is not None:
+             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+             tokens.append(tokenized_inputs)
+@@ -145,11 +177,17 @@ class Pi0(_model.BaseModel):
+         at.Bool[at.Array, " s"],
+         at.Float[at.Array, "b emb"] | None,
+     ]:
++        """将带噪动作及其时间步编码为动作专家后缀。
++
++        Pi0 还把连续机器人状态编码成单独 token；Pi0.5 则假设状态已在上游离散化并
++        并入 prompt，因此不在此重复输入。动作序列第一个 token 开启新的因果块，之后
++        的动作 token 同块互相可见。返回的 ``adarms_cond`` 仅供 Pi0.5 时间条件归一化使用。
++        """
+         input_mask = []
+         ar_mask = []
+         tokens = []
+         if not self.pi05:
+-            # add a single state token
++            # Pi0 使用连续状态向量；输入维度应与 action_dim 配置一致。
+             state_token = self.state_proj(obs.state)[:, None, :]
+             tokens.append(state_token)
+             input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
+@@ -157,10 +195,10 @@ class Pi0(_model.BaseModel):
+             ar_mask += [True]
+ 
+         action_tokens = self.action_in_proj(noisy_actions)
+-        # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
++        # 时间步 t∈[0,1] 用正弦余弦编码，随后采用对应模型分支的时间条件注入方式。
+         time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
+         if self.pi05:
+-            # time MLP (for adaRMS)
++            # Pi0.5：MLP 处理时间嵌入，并通过 adaRMSNorm 条件路径调制专家网络。
+             time_emb = self.time_mlp_in(time_emb)
+             time_emb = nnx.swish(time_emb)
+             time_emb = self.time_mlp_out(time_emb)
+@@ -168,7 +206,7 @@ class Pi0(_model.BaseModel):
+             action_expert_tokens = action_tokens
+             adarms_cond = time_emb
+         else:
+-            # mix timestep + action information using an MLP (no adaRMS)
++            # Pi0：每个动作 token 与广播后的时间嵌入拼接，经 MLP 混合后输入专家。
+             time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+             action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
+             action_time_tokens = self.action_time_mlp_in(action_time_tokens)
+@@ -189,17 +227,25 @@ class Pi0(_model.BaseModel):
+     def compute_loss(
+         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+     ) -> at.Float[at.Array, "*b ah"]:
++        """计算流匹配训练损失，监督模型预测从噪声走向真实动作的速度场。
++
++        对每个真实动作块采样标准高斯噪声和时间 t，线性插值得到中间状态 x_t；
++        目标向量场为 noise - actions。模型在图像/文本前缀条件下预测该向量场，
++        返回逐动作时间步的均方误差（在动作维度上取平均）。train=True 时同时启用
++        观测预处理中的随机图像增强。输入 actions 必须已经按训练数据配置处理。
++        """
+         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+ 
+         batch_shape = actions.shape[:-2]
+         noise = jax.random.normal(noise_rng, actions.shape)
++        # Beta 分布使训练时间采样偏向接近数据端的区域，同时避开精确端点 0 和 1。
+         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+         time_expanded = time[..., None, None]
+         x_t = time_expanded * noise + (1 - time_expanded) * actions
+         u_t = noise - actions
+ 
+-        # one big forward pass of prefix + suffix at once
++        # 将条件前缀和动作后缀拼接成一次 Transformer 前向，训练时不需要重复编码前缀。
+         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+@@ -222,40 +268,44 @@ class Pi0(_model.BaseModel):
+         num_steps: int | at.Int[at.Array, ""] = 10,
+         noise: at.Float[at.Array, "b ah ad"] | None = None,
+     ) -> _model.Actions:
++        """通过显式 Euler 积分从高斯噪声生成一个动作块。
++
++        初始时刻 t=1 对应噪声，逐步减小到 t=0；每一步由模型估计当前速度场并更新
++        ``x <- x + dt * v``。条件前缀的 KV cache 只计算一次并在各积分步复用。增大
++        num_steps 通常会增加推理计算量；返回值仍处于模型动作空间，部署适配层负责
++        必要的逆归一化和机器人动作格式转换。
++        """
+         observation = _model.preprocess_observation(None, observation, train=False)
+-        # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
+-        # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
++        # 此实现采用扩散文献常见方向：t=1 为噪声，t=0 为目标动作分布。
+         dt = -1.0 / num_steps
+         batch_size = observation.state.shape[0]
+         if noise is None:
+             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+ 
+-        # first fill KV cache with a forward pass of the prefix
++        # 条件前缀与其 KV cache 在每轮去噪中不变，因此预先计算一次以降低重复开销。
+         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+         positions = jnp.cumsum(prefix_mask, axis=1) - 1
+         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+ 
+         def step(carry):
++            """单次 ODE 积分更新：预测速度场、更新动作状态和时间。"""
+             x_t, time = carry
+             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                 observation, x_t, jnp.broadcast_to(time, batch_size)
+             )
+-            # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
+-            # other
++            # 后缀内部掩码控制动作 token 之间的因果/分块可见关系。
+             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+-            # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
+-            # prefix tokens
++            # 每个动作 query 都可以读取所有有效条件前缀 token。
+             prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+-            # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
+-            # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
++            # 拼接 key 维度上的前缀和后缀掩码，供带 prefix KV cache 的增量前向使用。
+             full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+             assert full_attn_mask.shape == (
+                 batch_size,
+                 suffix_tokens.shape[1],
+                 prefix_tokens.shape[1] + suffix_tokens.shape[1],
+             )
+-            # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
++            # 后缀位置从每个样本有效前缀长度之后开始，并跳过后缀中的无效位置。
+             positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+ 
+             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+@@ -271,8 +321,9 @@ class Pi0(_model.BaseModel):
+             return x_t + dt * v_t, time + dt
+ 
+         def cond(carry):
++            """只要时间仍未走过最后一个积分区间，就继续循环。"""
+             x_t, time = carry
+-            # robust to floating-point error
++            # 半步容差避免浮点误差导致多执行或漏执行一次积分。
+             return time >= -dt / 2
+ 
+         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+diff --git a/src/openpi/models/pi0_config.py b/src/openpi/models/pi0_config.py
+index 584d83f..ed4c8e9 100644
+--- a/src/openpi/models/pi0_config.py
++++ b/src/openpi/models/pi0_config.py
+@@ -1,3 +1,5 @@
++"""Pi0 模型结构配置及输入规格声明。"""
++
+ import dataclasses
+ from typing import TYPE_CHECKING
+ 
+@@ -17,25 +19,39 @@ if TYPE_CHECKING:
+ 
+ @dataclasses.dataclass(frozen=True)
+ class Pi0Config(_model.BaseModelConfig):
++    """Pi0 / Pi0.5 网络的结构与初始化配置。
++
++    此配置描述模型本身的规模、精度及动作/文本张量规格，不等同于完整训练配置；
++    数据集、归一化统计量和优化器等由 ``training.config.TrainConfig`` 管理。
++    ``pi05=True`` 会启用 Pi0.5 特有的离散状态输入和动作专家时间步调制逻辑。
++    """
++
++    # 激活值/权重计算所用精度；通常以 bfloat16 降低显存占用。
+     dtype: str = "bfloat16"
++    # PaliGemma 视觉语言主干的模型变体。
+     paligemma_variant: _gemma.Variant = "gemma_2b"
++    # 与主干共同处理动作序列的动作专家规模/变体。
+     action_expert_variant: _gemma.Variant = "gemma_300m"
+ 
+-    # Set the model specific defaults.
++    # 每一步动作向量的维数，以及一次预测的未来动作步数。
++    # 二者必须与数据预处理后的动作张量最后两维一致。
+     action_dim: int = 32
+     action_horizon: int = 50
++    # 语言 token 的最大序列长度；未显式指定时由 __post_init__ 按模型类型设置。
+     max_token_len: int = None  # type: ignore
+-    # Pi05 has two differences from Pi0:
+-    # - the state input is part of the discrete language tokens rather than a continuous input that is part of the suffix
+-    # - the action expert uses adaRMSNorm to inject the flow matching timestep
++    # Pi0.5 与 Pi0 的关键结构差异：状态被离散化并并入语言 token；动作专家通过
++    # adaRMSNorm 注入流匹配时间步。此开关会影响模型结构，不能只为改数据格式而切换。
+     pi05: bool = False
+-    # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
++    # 告知 ModelTransformFactory 是否将状态按离散 token 路径编码；默认跟随 pi05。
+     discrete_state_input: bool = None  # type: ignore
+ 
++    # PyTorch 编译使用的模式；None 表示不启用 torch.compile。
+     pytorch_compile_mode: str | None = "max-autotune"
+ 
+     def __post_init__(self):
++        """补齐依赖模型类型的默认值，并校验编译模式名称。"""
+         if self.max_token_len is None:
++            # Pi0.5 使用更长的语言上下文，Pi0 则沿用较短默认值。
+             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
+         if self.discrete_state_input is None:
+             object.__setattr__(self, "discrete_state_input", self.pi05)
+@@ -50,18 +66,26 @@ class Pi0Config(_model.BaseModelConfig):
+     @property
+     @override
+     def model_type(self) -> _model.ModelType:
++        """返回用于选择对应预处理/策略分支的模型类型枚举。"""
+         if self.pi05:
+             return _model.ModelType.PI05
+         return _model.ModelType.PI0
+ 
+     @override
+     def create(self, rng: at.KeyArrayLike) -> "Pi0":
++        """按当前配置创建并初始化 Pi0 网络及其随机数状态。"""
+         from openpi.models.pi0 import Pi0
+ 
+         return Pi0(self, rngs=nnx.Rngs(rng))
+ 
+     @override
+     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
++        """声明模型期望的观测与动作形状，用于初始化和数据管线检查。
++
++        规格包含三路 224×224 RGB 图像、每路有效性掩码、状态、tokenized prompt，
++        以及 ``[batch, action_horizon, action_dim]`` 动作块。这里的 shape 是接口契约，
++        不意味着所有任务的状态和动作语义都相同。
++        """
+         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
+ 
+@@ -86,7 +110,11 @@ class Pi0Config(_model.BaseModelConfig):
+         return observation_spec, action_spec
+ 
+     def get_freeze_filter(self) -> nnx.filterlib.Filter:
+-        """Returns the freeze filter based on the model config."""
++        """根据 LoRA 变体构造参数冻结筛选器。
++
++        返回的筛选器供训练状态决定哪些参数参与更新：普通权重可冻结，而 LoRA 参数
++        保持可训练；若没有配置 LoRA，则返回 NNX 的空筛选器，表示不额外冻结参数。
++        """
+         filters = []
+         has_lora = False
+         gemma_params_filter = nnx_utils.PathRegex(".*llm.*")
+diff --git a/src/openpi/policies/policy.py b/src/openpi/policies/policy.py
+index b9b708b..9870d2a 100644
+--- a/src/openpi/policies/policy.py
++++ b/src/openpi/policies/policy.py
+@@ -1,3 +1,5 @@
++"""通用推理封装：连接模型、数据变换与策略客户端。"""
++
+ from collections.abc import Sequence
+ import logging
+ import pathlib
+@@ -22,6 +24,7 @@ BasePolicy: TypeAlias = _base_policy.BasePolicy
+ 
+ 
+ class Policy(BasePolicy):
++    """提供统一 infer 接口，并负责模型输入/输出变换和结果封装。"""
+     def __init__(
+         self,
+         model: _model.BaseModel,
+diff --git a/src/openpi/policies/policy_config.py b/src/openpi/policies/policy_config.py
+index 6570df0..299d023 100644
+--- a/src/openpi/policies/policy_config.py
++++ b/src/openpi/policies/policy_config.py
+@@ -1,8 +1,13 @@
++"""根据训练配置和 checkpoint 组装可运行的策略对象。"""
++
+ import logging
+ import os
+ import pathlib
+ from typing import Any
+ 
++# LeRobot loads native video dependencies. Import it before JAX to avoid a
++# native-library initialization crash when creating a local Z1 policy server.
++import lerobot.common.datasets.lerobot_dataset as _lerobot_dataset_compat
+ import jax.numpy as jnp
+ 
+ import openpi.models.model as _model
+diff --git a/src/openpi/shared/normalize.py b/src/openpi/shared/normalize.py
+index 5a75fae..2657155 100644
+--- a/src/openpi/shared/normalize.py
++++ b/src/openpi/shared/normalize.py
+@@ -1,3 +1,5 @@
++"""计算、序列化和加载训练所用的归一化统计量。"""
++
+ import json
+ import pathlib
+ 
+@@ -15,6 +17,7 @@ class NormStats:
+ 
+ 
+ class RunningStats:
++    """以流式方式累计数据统计，避免一次性加载全部样本。"""
+     """Compute running statistics of a batch of vectors."""
+ 
+     def __init__(self):
+diff --git a/src/openpi/training/checkpoints.py b/src/openpi/training/checkpoints.py
+index f32a831..6b06c22 100644
+--- a/src/openpi/training/checkpoints.py
++++ b/src/openpi/training/checkpoints.py
+@@ -1,3 +1,5 @@
++"""训练状态与模型 checkpoint 的保存、恢复及资产管理。"""
++
+ from __future__ import annotations
+ 
+ import asyncio
+diff --git a/src/openpi/transforms.py b/src/openpi/transforms.py
+index 272375e..68300b6 100644
+--- a/src/openpi/transforms.py
++++ b/src/openpi/transforms.py
+@@ -1,3 +1,10 @@
++"""训练与推理共用的数据变换组件。
++
++本模块把不同数据集的字段、形状和动作约定整理为模型统一格式。变换顺序很重要：
++通常先重排字段、再做机器人数据适配与归一化；推理时还需对模型输出执行逆变换。
++动作绝对值/增量、状态维度及统计量必须与训练阶段匹配。
++"""
++
+ from collections.abc import Callable, Mapping, Sequence
+ import dataclasses
+ import re
